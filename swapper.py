@@ -23,6 +23,12 @@ from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+try:
+    import webview
+    HAS_WEBVIEW = True
+except ImportError:
+    HAS_WEBVIEW = False
+
 SWAPPER_PORT = 9753
 POLL_INTERVAL = 1.0
 LCU_BASE_URL = None
@@ -768,10 +774,32 @@ class SwapHandler(BaseHTTPRequestHandler):
         pass
 
 
-def run_server():
+def run_server_in_thread():
+    server = HTTPServer(('127.0.0.1', SWAPPER_PORT), SwapHandler)
+    server.serve_forever()
+
+
+def run_desktop():
+    print('[Desktop] Starting desktop window...')
+    server_thread = threading.Thread(target=run_server_in_thread, daemon=True)
+    server_thread.start()
+    time.sleep(0.5)
+    webview.create_window(
+        'ARAM 秒换英雄',
+        f'http://127.0.0.1:{SWAPPER_PORT}',
+        width=500, height=700, resizable=True,
+    )
+    webview.start(private_mode=False)
+    print('\nShutting down...')
+
+
+def run_browser():
     server = HTTPServer(('127.0.0.1', SWAPPER_PORT), SwapHandler)
     print(f'[Web UI] http://127.0.0.1:{SWAPPER_PORT}')
-    print(f'[Info] Open in browser')
+    try:
+        webbrowser.open(f'http://127.0.0.1:{SWAPPER_PORT}')
+    except Exception:
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -793,12 +821,10 @@ def main():
     poll_thread.start()
     time.sleep(1)
 
-    try:
-        webbrowser.open(f'http://127.0.0.1:{SWAPPER_PORT}')
-    except Exception:
-        pass
-
-    run_server()
+    if HAS_WEBVIEW:
+        run_desktop()
+    else:
+        run_browser()
 
 
 if __name__ == '__main__':
