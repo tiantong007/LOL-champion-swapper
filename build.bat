@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [Build] Packaging with PyInstaller...
-pyinstaller --onefile --name "ARAM秒换英雄" --noconsole --add-data "LICENSE;." swapper.py
+pyinstaller --onefile --name "ARAM秒换英雄" --noconsole --uac-admin --icon app.ico swapper.py
 
 if %errorlevel% equ 0 (
     echo.
