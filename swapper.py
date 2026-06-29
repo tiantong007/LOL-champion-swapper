@@ -10,18 +10,15 @@ import ctypes.wintypes
 import json
 import os
 import re
-import ssl
-import struct
-import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import webbrowser
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+
+import requests
 
 try:
     import webview
@@ -30,7 +27,8 @@ except ImportError:
     HAS_WEBVIEW = False
 
 SWAPPER_PORT = 9753
-POLL_INTERVAL = 1.0
+POLL_INTERVAL = 0.3
+
 LCU_BASE_URL = None
 LCU_AUTH = None
 LCU_HEADERS = {}
@@ -39,76 +37,28 @@ SESSION_CACHE = None
 CONNECTED = False
 GAMEFLOW_PHASE = None
 LAST_ERROR = None
+
 SWAP_LOG = []
-NEED_ADMIN = False
+_LCU_SESSION = None
 
-WMIC_PATH = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'),
-                         'System32', 'wbem', 'WMIC.exe')
-
-# ============================================================
-# LCU Discovery
-# ============================================================
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        return False
-
-
-def elevate():
-    """Restart the script as administrator"""
-    if not is_admin():
-        print('[Swapper] WMI command line reading requires admin rights.')
-        print('[Swapper] Attempting to restart as administrator...')
-        try:
-            script = (
-                'Start-Process python -ArgumentList '
-                f'"\\"{sys.argv[0]}\\"" '
-                '-Verb RunAs'
-            )
-            subprocess.run(['powershell', '-NoProfile', '-Command', script],
-                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
-            print('[Swapper] Elevation requested. If UAC prompt appears, please accept it.')
-            sys.exit(0)
-        except Exception:
-            print('[Swapper] Elevation failed. You can manually run as admin:')
-            print(f'         Right-click "start.bat" -> Run as administrator')
-
-
-def find_lcu_via_ctypes():
-    """Use ctypes to get exe path (no elevation needed), then read lockfile"""
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-    for proc_name, pid in _get_pids_fast():
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            continue
-        try:
-            buf = ctypes.create_unicode_buffer(260)
-            sz = ctypes.wintypes.DWORD(260)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(sz)):
-                exe_path = buf.value
-                for d in [os.path.dirname(exe_path), os.path.dirname(os.path.dirname(exe_path))]:
-                    lf = os.path.join(d, 'lockfile')
-                    if os.path.exists(lf) and os.path.getsize(lf) > 0:
-                        with open(lf, 'r') as f:
-                            content = f.read().strip()
-                        parts = content.split(':')
-                        if len(parts) >= 4:
-                            return {
-                                'port': int(parts[1]),
-                                'auth_token': parts[2],
-                                'pid': int(parts[0])
-                            }
-                        return None
-        finally:
-            kernel32.CloseHandle(handle)
-    return None
+PHASE_TRANSLATIONS = {
+    'None': '大厅',
+    'Lobby': '大厅',
+    'Matchmaking': '匹配中',
+    'ReadyCheck': '接受对局',
+    'ChampSelect': '选人中',
+    'GameStart': '加载中',
+    'InProgress': '游戏中',
+    'WaitingForStats': '等待统计',
+    'PreEndOfGame': '结算中',
+    'EndOfGame': '结算完成',
+    'Reconnect': '重新连接',
+    'TerminatedInError': '异常结束',
+}
 
 
 def find_lcu_via_logs():
-    """Fallback for Tencent/WeGame: parse --remoting-auth-token from LCU log files"""
+    """Parse --remoting-auth-token from LCU log files"""
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -190,95 +140,11 @@ def _get_pids_fast():
         kernel32.CloseHandle(snapshot)
 
 
-def find_lcu_via_powershell():
-    script = '''
-    $processes = Get-CimInstance -ClassName Win32_Process |
-        Where-Object { $_.Name -match 'LeagueClientUx\\.exe$|^LeagueClient\\.exe$' }
-    foreach ($p in $processes) {
-        [PSCustomObject]@{ Pid = $p.ProcessId; CmdLine = $p.CommandLine }
-    }
-    '''
-    try:
-        result = subprocess.run(
-            ['powershell', '-NoProfile', '-Command', script],
-            capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        if result.returncode != 0:
-            return None, False
-
-        all_empty = True
-        for line in result.stdout.split('\n'):
-            line = line.strip()
-            if line.startswith('@{') and 'Pid=' in line:
-                parts = line.strip('@{}').split('; ')
-                cmdline = None
-                for p in parts:
-                    if p.startswith('CmdLine='):
-                        cmdline = p.split('=', 1)[1]
-                        if cmdline.startswith(' ' * 32):
-                            cmdline = cmdline[32:]
-                        cmdline = cmdline.strip()
-                        break
-                if cmdline:
-                    all_empty = False
-                    parsed = parse_lcu_cmdline(cmdline)
-                    if parsed:
-                        return parsed, False
-        if all_empty:
-            return None, True  # WMI returned but cmdline was empty
-        return None, False
-    except Exception:
-        return None, False
-
-
-def find_lcu_via_wmic():
-    try:
-        for name in ['LeagueClientUx.exe', 'LeagueClient.exe']:
-            result = subprocess.run(
-                [WMIC_PATH, 'process', 'where', f"name like '%{name}%'", 'get', 'CommandLine'],
-                capture_output=True, text=True, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if result.returncode == 0:
-                for line in result.stdout.split('\n'):
-                    line = line.strip()
-                    if not line or line.upper() == 'COMMANDLINE':
-                        continue
-                    parsed = parse_lcu_cmdline(line)
-                    if parsed:
-                        return parsed
-    except Exception:
-        pass
-    return None
-
-
-def parse_lcu_cmdline(cmdline):
-    port_match = re.search(r'--app-port=([0-9]+)', cmdline)
-    auth_match = re.search(r'--remoting-auth-token=([\w\-_]+)', cmdline)
-    pid_match = re.search(r'--app-pid=([0-9]+)', cmdline)
-    if port_match and auth_match:
-        return {
-            'port': int(port_match.group(1)),
-            'auth_token': auth_match.group(1),
-            'pid': int(pid_match.group(1)) if pid_match else 0
-        }
-    return None
-
-
 def discover_lcu():
-    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS, NEED_ADMIN
+    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS
 
-    info, wmi_blocked = find_lcu_via_powershell()
-    if not info and not wmi_blocked:
-        info = find_lcu_via_wmic()
+    info = find_lcu_via_logs()
     if not info:
-        info = find_lcu_via_ctypes()
-    if not info:
-        info = find_lcu_via_logs()
-    if not info:
-        if wmi_blocked and not is_admin():
-            NEED_ADMIN = True
         return False
 
     LCU_AUTH = info
@@ -297,25 +163,40 @@ def discover_lcu():
 
 
 # ============================================================
-# LCU HTTP Client
+# LCU HTTP Client (requests.Session 连接池复用)
 # ============================================================
-ssl_ctx = ssl._create_unverified_context()
+
+def _ensure_session():
+    global _LCU_SESSION
+    if _LCU_SESSION is None:
+        _LCU_SESSION = requests.Session()
+        _LCU_SESSION.verify = False
+    _LCU_SESSION.headers.update({
+        'Authorization': LCU_HEADERS.get('Authorization', ''),
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    })
+    return _LCU_SESSION
+
 
 def _lcu_request(method, path, body=None):
     if not LCU_BASE_URL:
         return None
     url = f'{LCU_BASE_URL}{path}'
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, headers=LCU_HEADERS, method=method)
+    s = _ensure_session()
     try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+        resp = s.request(method, url, json=body if body is not None else None,
+                         timeout=5)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
             return None
         raise
-    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+    except (requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout) as e:
         raise
 
 def lcu_get(path): return _lcu_request('GET', path)
@@ -341,11 +222,13 @@ def fetch_champion_icon(champion_id):
     try:
         path = f'/lol-game-data/assets/v1/champion-icons/{champion_id}.png'
         url = f'{LCU_BASE_URL}{path}'
-        req = urllib.request.Request(url, headers=LCU_HEADERS)
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as resp:
-            return resp.read()
+        s = _ensure_session()
+        resp = s.get(url, timeout=5)
+        if resp.status_code == 200:
+            return resp.content
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ============================================================
@@ -354,11 +237,23 @@ def fetch_champion_icon(champion_id):
 def swap_bench_champion(champion_id):
     try:
         lcu_post(f'/lol-champ-select/v1/session/bench/swap/{champion_id}')
-        log_swap(f'Swapped to champion #{champion_id} ({CHAMPION_NAMES.get(champion_id, "?")})')
+        log_swap(f'已换到英雄 #{champion_id} ({CHAMPION_NAMES.get(champion_id, "?")})')
+        _refresh_after_swap()
         return True
     except Exception as e:
-        log_swap(f'Swap failed: champion #{champion_id} - {str(e)}')
+        log_swap(f'换英雄失败: #{champion_id} - {str(e)}')
         return False
+
+
+def _refresh_after_swap():
+    global SESSION_CACHE, POLLING_RESULT
+    try:
+        session = lcu_get('/lol-champ-select/v1/session')
+        if session and 'benchChampions' in session:
+            SESSION_CACHE = session
+            POLLING_RESULT = _build_champ_select_result(session)
+    except Exception:
+        pass
 
 
 def quick_pick_champion(champion_id, action_id):
@@ -366,10 +261,10 @@ def quick_pick_champion(champion_id, action_id):
         lcu_patch(f'/lol-champ-select/v1/session/actions/{action_id}', {
             'championId': champion_id, 'completed': True, 'type': 'pick'
         })
-        log_swap(f'Picked champion #{champion_id} ({CHAMPION_NAMES.get(champion_id, "?")})')
+        log_swap(f'已选择英雄 #{champion_id} ({CHAMPION_NAMES.get(champion_id, "?")})')
         return True
     except Exception as e:
-        log_swap(f'Pick failed: champion #{champion_id} - {str(e)}')
+        log_swap(f'选英雄失败: #{champion_id} - {str(e)}')
         return False
 
 
@@ -387,36 +282,81 @@ def log_swap(msg):
 # State Polling
 # ============================================================
 POLLING_RESULT = {'connected': False, 'inChampSelect': False, 'champions': [],
-                  'phase': None, 'error': 'Starting...', 'needAdmin': False}
+                  'phase': None, 'error': '正在启动...', 'needAdmin': False}
+
+
+def _build_champ_select_result(session):
+    bench = session.get('benchChampions', [])
+    champ_ids = [b['championId'] for b in bench if b.get('championId')]
+    pickable = set(session.get('pickableChampionIds', []))
+    disabled = set(session.get('bannableChampionIds', []))
+    try:
+        disabled_ids = lcu_get('/lol-champ-select/v1/disabled-champion-ids')
+        if disabled_ids:
+            disabled = set(disabled_ids)
+    except Exception:
+        pass
+    my_team = session.get('myTeam', [])
+    local_cell = session.get('localPlayerCellId', 0)
+    actions_flat = [a for group in session.get('actions', []) for a in group]
+    first_pick_action = None
+    for a in actions_flat:
+        if a.get('type') == 'pick' and not a.get('completed') and a.get('actorCellId') == local_cell:
+            first_pick_action = a
+            break
+    timer_phase = session.get('timer', {}).get('phase', '')
+    self_cid = next((m.get('championId', 0) for m in my_team if m.get('cellId') == local_cell), 0)
+    return {
+        'connected': True, 'inChampSelect': True, 'phase': timer_phase,
+        'benchEnabled': session.get('benchEnabled', False),
+        'champions': [{'id': cid, 'name': CHAMPION_NAMES.get(cid, f'#{cid}'),
+                        'pickable': cid in pickable, 'disabled': cid in disabled}
+                      for cid in champ_ids],
+        'pickableIds': list(pickable),
+        'selfChampion': self_cid,
+        'selfChampionName': CHAMPION_NAMES.get(self_cid),
+        'firstPickAction': {'id': first_pick_action['id'],
+                            'isInProgress': first_pick_action.get('isInProgress', False)}
+        if first_pick_action else None,
+        'timerPhase': timer_phase, 'error': None, 'needAdmin': False,
+    }
 
 
 def poll_state():
     global CONNECTED, GAMEFLOW_PHASE, SESSION_CACHE, POLLING_RESULT, LAST_ERROR
-    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS, NEED_ADMIN
+    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS, CONNECT_ERROR_COUNT, _LCU_SESSION
 
     while True:
         try:
             if not LCU_BASE_URL:
                 if discover_lcu():
                     CONNECTED = True
+                    CONNECT_ERROR_COUNT = 0
+                    POLLING_RESULT = {
+                        'connected': True, 'inChampSelect': False, 'phase': None,
+                        'benchEnabled': False, 'champions': [], 'pickableIds': [],
+                        'selfChampion': 0, 'selfChampionName': None,
+                        'firstPickAction': None, 'timerPhase': None,
+                        'error': None, 'needAdmin': False,
+                    }
                     fetch_champion_names()
-                    print(f'[Swapper] Connected to LCU at {LCU_BASE_URL}')
+                    print(f'[Swapper] 已连接 LCU: {LCU_BASE_URL}')
                 else:
-                    error_msg = 'Waiting for League Client...'
-                    if NEED_ADMIN and not is_admin():
-                        error_msg = ('Cannot read LCU info - need admin rights. '
-                                     'Right-click start.bat -> Run as administrator')
                     POLLING_RESULT = {
                         'connected': False, 'inChampSelect': False, 'phase': None,
-                        'champions': [], 'error': error_msg, 'needAdmin': NEED_ADMIN and not is_admin()
+                        'champions': [], 'error': '等待英雄联盟客户端...', 'needAdmin': False
                     }
                     time.sleep(POLL_INTERVAL)
                     continue
 
+            if not CHAMPION_NAMES:
+                fetch_champion_names()
+
             try:
                 gf = lcu_get('/lol-gameflow/v1/session')
                 if gf and 'phase' in gf:
-                    GAMEFLOW_PHASE = gf['phase']
+                    raw = gf['phase']
+                    GAMEFLOW_PHASE = PHASE_TRANSLATIONS.get(raw, raw)
                 else:
                     GAMEFLOW_PHASE = None
             except Exception:
@@ -431,58 +371,31 @@ def poll_state():
             SESSION_CACHE = session
 
             if session and 'benchChampions' in session:
-                bench = session.get('benchChampions', [])
-                champ_ids = [b['championId'] for b in bench if b.get('championId')]
-                pickable = set(session.get('pickableChampionIds', []))
-                disabled = set(session.get('bannableChampionIds', []))
-                try:
-                    disabled_ids = lcu_get('/lol-champ-select/v1/disabled-champion-ids')
-                    if disabled_ids:
-                        disabled = set(disabled_ids)
-                except Exception:
-                    pass
-                my_team = session.get('myTeam', [])
-                local_cell = session.get('localPlayerCellId', 0)
-                actions_flat = [a for group in session.get('actions', []) for a in group]
-                first_pick_action = None
-                for a in actions_flat:
-                    if a.get('type') == 'pick' and not a.get('completed') and a.get('actorCellId') == local_cell:
-                        first_pick_action = a
-                        break
-                timer_phase = session.get('timer', {}).get('phase', '')
-                POLLING_RESULT = {
-                    'connected': True, 'inChampSelect': True, 'phase': timer_phase,
-                    'benchEnabled': session.get('benchEnabled', False),
-                    'champions': [{'id': cid, 'name': CHAMPION_NAMES.get(cid, f'Champion {cid}'),
-                                   'pickable': cid in pickable, 'disabled': cid in disabled}
-                                  for cid in champ_ids],
-                    'pickableIds': list(pickable),
-                    'selfChampion': next((m.get('championId', 0) for m in my_team if m.get('cellId') == local_cell), 0),
-                    'firstPickAction': {'id': first_pick_action['id'],
-                                        'isInProgress': first_pick_action.get('isInProgress', False)}
-                    if first_pick_action else None,
-                    'timerPhase': timer_phase, 'error': None, 'needAdmin': False
-                }
+                POLLING_RESULT = _build_champ_select_result(session)
             else:
                 POLLING_RESULT = {
                     'connected': CONNECTED, 'inChampSelect': False, 'phase': GAMEFLOW_PHASE,
                     'benchEnabled': False, 'champions': [], 'pickableIds': [],
-                    'selfChampion': 0, 'firstPickAction': None, 'timerPhase': None,
+                    'selfChampion': 0, 'selfChampionName': None,
+                    'firstPickAction': None, 'timerPhase': None,
                     'error': None, 'needAdmin': False
                 }
 
+            CONNECT_ERROR_COUNT = 0
             LAST_ERROR = None
 
         except Exception as e:
             estr = str(e)
-            if 'Connection refused' in estr or 'Connect error' in estr or 'SSL' in estr:
+            is_connect_refused = 'Connection refused' in estr
+            if is_connect_refused:
                 CONNECTED = False
                 LCU_BASE_URL = None
                 LCU_AUTH = None
-                print('[Swapper] Lost connection to LCU, will retry...')
+                _LCU_SESSION = None
+                print(f'[Swapper] LCU 连接被拒绝，正在重试...')
             elif LAST_ERROR is None or estr != LAST_ERROR:
                 LAST_ERROR = estr
-                print(f'[Swapper] Poll error: {e}')
+                print(f'[Swapper] 轮询错误: {e}')
             POLLING_RESULT = {
                 'connected': CONNECTED, 'inChampSelect': False, 'phase': None,
                 'champions': [], 'error': estr, 'needAdmin': False
@@ -560,7 +473,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="container" id="app">
   <div class="header">
     <h1>&#x26A1; <span>ARAM</span> 秒换英雄</h1>
-    <div><button class="btn secondary" onclick="window.close()">关闭</button></div>
   </div>
 
   <div id="status-bar" class="status-bar waiting">
@@ -574,14 +486,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   </div>
 
   <div class="info-row">
-    <div class="info-card"><div class="label">游戏阶段</div><div class="value" id="phase-value">-</div></div>
     <div class="info-card"><div class="label">模式</div><div class="value" id="mode-value">-</div></div>
     <div class="info-card"><div class="label">当前英雄</div><div class="value" id="self-champ-value">-</div></div>
   </div>
 
-  <div class="section-title">&#x1FA91; 板凳英雄 <span id="champ-count" style="color:#6b7280;font-weight:400"></span></div>
+  <div class="section-title">&#x1FA91; 可选英雄 <span id="champ-count" style="color:#6b7280;font-weight:400"></span></div>
   <div id="champ-grid" class="champ-grid">
-    <div class="empty-state"><p id="empty-text">等待进入选人阶段...</p></div>
+    <div class="empty-state"><p id="empty-text">等待进入选人...</p></div>
   </div>
 
   <div class="log-section">
@@ -594,10 +505,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 const POLL_URL = '/api/state';
 function poll(){
   fetch(POLL_URL).then(r=>r.json()).then(updateUI).catch(()=>{});
-  setTimeout(poll, 800);
+  setTimeout(poll, 300);
 }
 
 function updateUI(data){
+  const dk = JSON.stringify(data);
+  if (dk === _lastDataKey) return;
+  _lastDataKey = dk;
   const sb = document.getElementById('status-bar');
   const st = document.getElementById('status-text');
   const ab = document.getElementById('admin-banner');
@@ -606,7 +520,6 @@ function updateUI(data){
     sb.className = 'status-bar disconnected';
     st.textContent = '需要管理员权限';
     ab.style.display = 'block';
-    document.getElementById('phase-value').textContent = '-';
     document.getElementById('mode-value').textContent = '-';
     document.getElementById('self-champ-value').textContent = '-';
     document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + data.error + '</p></div>';
@@ -617,49 +530,43 @@ function updateUI(data){
   if (!data.connected) {
     sb.className = 'status-bar disconnected';
     st.textContent = data.error || '未连接';
-    document.getElementById('phase-value').textContent = '断开';
     document.getElementById('mode-value').textContent = '-';
     document.getElementById('self-champ-value').textContent = '-';
-    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + (data.error||'等待游戏客户端...') + '</p></div>';
+    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + (data.error||'等待客户端...') + '</p></div>';
     return;
   }
 
   if (!data.inChampSelect) {
     sb.className = 'status-bar waiting';
-    st.textContent = '已连接，等待进入选人阶段...';
-    document.getElementById('phase-value').textContent = data.phase || '大厅';
+    st.textContent = '已连接 (' + (data.phase || '大厅') + ')';
     document.getElementById('mode-value').textContent = '-';
     document.getElementById('self-champ-value').textContent = '-';
-    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>等待进入选人阶段...</p></div>';
+    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>等待进入选人...</p></div>';
     return;
   }
 
   sb.className = 'status-bar connected';
-  st.textContent = '已连接 - 选人中';
-  document.getElementById('phase-value').textContent = data.timerPhase || '-';
-  document.getElementById('mode-value').textContent = data.benchEnabled ? '大乱斗 (板凳模式)' : '普通模式';
+  st.textContent = '选人中 · ' + (data.champions.length + '个可选');
+  document.getElementById('mode-value').textContent = data.benchEnabled ? '大乱斗 (可选模式)' : '普通模式';
   const sc = data.selfChampion || 0;
-  document.getElementById('self-champ-value').textContent = sc > 0 ? getName(sc, data) : '未选择';
+  document.getElementById('self-champ-value').textContent = data.selfChampionName || (sc > 0 ? '#' + sc : '未选择');
 
   if (data.benchEnabled) {
     renderBench(data.champions, sc);
   } else {
-    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>非板凳模式，仅限大乱斗使用</p></div>';
+    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>非可选模式，仅限大乱斗使用</p></div>';
   }
 }
 
-function getName(id, data){
-  if (data.champions) {
-    const c = data.champions.find(x => x.id === id);
-    if (c) return c.name;
-  }
-  return '#' + id;
-}
-
+let _lastDataKey = '';
+let _lastChampKey = '';
 function renderBench(champs, selfChamp){
+  const key = JSON.stringify(champs) + '|' + selfChamp;
+  if (key === _lastChampKey) return;
+  _lastChampKey = key;
   const grid = document.getElementById('champ-grid');
   if (!champs || champs.length === 0) {
-    grid.innerHTML = '<div class="empty-state"><p>板凳上没有英雄</p></div>';
+    grid.innerHTML = '<div class="empty-state"><p>暂无可选英雄</p></div>';
     document.getElementById('champ-count').textContent = '';
     return;
   }
@@ -678,9 +585,9 @@ async function swapChamp(id){
   try{
     const r = await fetch('/api/swap/' + id, {method:'POST'});
     const d = await r.json();
-    addLog(d.success?'success':'error', (d.success?'&#x2713; 换到: ':'&#x2717; 失败: ')+(d.name||'#'+id));
+    addLog(d.success?'success':'error', (d.success?'✓ 换到: ':'✗ 失败: ')+(d.name||'#'+id));
   }catch(e){
-    addLog('error', '&#x2717; 请求失败: '+e.message);
+    addLog('error', '✗ 请求失败: '+e.message);
   }
 }
 
@@ -733,9 +640,9 @@ class SwapHandler(BaseHTTPRequestHandler):
                 ok = swap_bench_champion(cid)
                 self._ok('application/json', json.dumps(
                     {'success': ok, 'name': CHAMPION_NAMES.get(cid, f'#{cid}'),
-                     'error': None if ok else 'See log'}).encode('utf-8'))
+                     'error': None if ok else '查看日志'}).encode('utf-8'))
             except ValueError:
-                self._ok('application/json', json.dumps({'success': False, 'error': 'Invalid ID'}).encode('utf-8'))
+                self._ok('application/json', json.dumps({'success': False, 'error': '无效ID'}).encode('utf-8'))
         elif path.startswith('/api/quick-pick/'):
             try:
                 parts = path.split('/api/quick-pick/')[1].split('/')
@@ -744,7 +651,7 @@ class SwapHandler(BaseHTTPRequestHandler):
                 self._ok('application/json', json.dumps(
                     {'success': ok, 'name': CHAMPION_NAMES.get(cid, f'#{cid}')}).encode('utf-8'))
             except (ValueError, IndexError):
-                self._ok('application/json', json.dumps({'success': False, 'error': 'Bad params'}).encode('utf-8'))
+                self._ok('application/json', json.dumps({'success': False, 'error': '参数错误'}).encode('utf-8'))
         else:
             self._err(404)
 
@@ -780,7 +687,7 @@ def run_server_in_thread():
 
 
 def run_desktop():
-    print('[Desktop] Starting desktop window...')
+    print('[Desktop] 正在启动桌面窗口...')
     server_thread = threading.Thread(target=run_server_in_thread, daemon=True)
     server_thread.start()
     time.sleep(0.5)
@@ -790,7 +697,7 @@ def run_desktop():
         width=500, height=700, resizable=True,
     )
     webview.start(private_mode=False)
-    print('\nShutting down...')
+    print('\n正在关闭...')
 
 
 def run_browser():
@@ -803,7 +710,7 @@ def run_browser():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print('\nShutting down...')
+        print('\n正在关闭...')
         server.shutdown()
 
 
@@ -814,7 +721,7 @@ def main():
         pass
 
     print('=' * 50)
-    print('  ARAM Instant Champion Swapper')
+    print('  ARAM 秒换英雄工具')
     print('=' * 50)
 
     poll_thread = threading.Thread(target=poll_state, daemon=True)
