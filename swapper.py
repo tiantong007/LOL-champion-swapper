@@ -473,6 +473,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="container" id="app">
   <div class="header">
     <h1>&#x26A1; <span>ARAM</span> 秒换英雄</h1>
+    <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub项目地址</a>
   </div>
 
   <div id="status-bar" class="status-bar waiting">
