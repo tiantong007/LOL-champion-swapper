@@ -16,14 +16,20 @@
 ### 直接运行
 
 ```bash
+pip install -r requirements.txt
 python swapper.py
 ```
 
-或双击 `start.bat`
+或双击 `start.bat`（自动安装依赖）
 
 ### 打包为 exe
 
-运行 `build.bat`，生成的可执行文件位于 `dist/海克斯大乱斗秒换英雄.exe`。
+```bash
+pip install pyinstaller
+python -m PyInstaller "海克斯大乱斗秒换英雄.spec" --clean
+```
+
+生成的可执行文件位于 `dist/海克斯大乱斗秒换英雄.exe`。
 
 ## 依赖
 
@@ -33,7 +39,7 @@ python swapper.py
 - PyInstaller（仅打包时需要）
 
 ```bash
-pip install requests pywebview
+pip install -r requirements.txt
 ```
 
 ## 原理
