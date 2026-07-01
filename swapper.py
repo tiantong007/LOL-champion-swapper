@@ -412,14 +412,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>海斗秒换英雄</title>
+<title>海克斯大乱斗秒换英雄</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e14;color:#c8cbd1;min-height:100vh}
   .container{max-width:800px;margin:0 auto;padding:20px}
   .header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid #1e232c;margin-bottom:24px}
-  .header h1{font-size:20px;font-weight:700;color:#e0e3e8}
-  .header h1 span{color:#f59e0b}
+  .header h1{font-size:20px;font-weight:700;color:#f59e0b}
   .status-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:8px;margin-bottom:20px;font-size:13px}
   .status-bar.connected{background:#0d2818;color:#4ade80}
   .status-bar.disconnected{background:#2d1b1b;color:#f87171}
@@ -472,7 +471,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
 <div class="container" id="app">
   <div class="header">
-    <h1>&#x26A1; <span>海斗</span>秒换英雄</h1>
+    <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.1</span></h1>
     <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub项目地址</a>
   </div>
 
@@ -693,7 +692,7 @@ def run_desktop():
     server_thread.start()
     time.sleep(0.5)
     webview.create_window(
-        '海斗秒换英雄',
+        '海克斯大乱斗秒换英雄',
         f'http://127.0.0.1:{SWAPPER_PORT}',
         width=500, height=700, resizable=True,
     )
@@ -722,7 +721,7 @@ def main():
         pass
 
     print('=' * 50)
-    print('  海斗秒换英雄工具')
+    print('  海克斯大乱斗秒换英雄工具')
     print('=' * 50)
 
     poll_thread = threading.Thread(target=poll_state, daemon=True)
