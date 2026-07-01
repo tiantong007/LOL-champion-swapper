@@ -412,7 +412,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARAM 秒换英雄</title>
+<title>海斗秒换英雄</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e14;color:#c8cbd1;min-height:100vh}
@@ -472,7 +472,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
 <div class="container" id="app">
   <div class="header">
-    <h1>&#x26A1; <span>ARAM</span> 秒换英雄</h1>
+    <h1>&#x26A1; <span>海斗</span>秒换英雄</h1>
     <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub项目地址</a>
   </div>
 
@@ -693,7 +693,7 @@ def run_desktop():
     server_thread.start()
     time.sleep(0.5)
     webview.create_window(
-        'ARAM 秒换英雄',
+        '海斗秒换英雄',
         f'http://127.0.0.1:{SWAPPER_PORT}',
         width=500, height=700, resizable=True,
     )
@@ -722,7 +722,7 @@ def main():
         pass
 
     print('=' * 50)
-    print('  ARAM 秒换英雄工具')
+    print('  海斗秒换英雄工具')
     print('=' * 50)
 
     poll_thread = threading.Thread(target=poll_state, daemon=True)
