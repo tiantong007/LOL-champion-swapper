@@ -30,10 +30,8 @@ SWAPPER_PORT = 9753
 POLL_INTERVAL = 0.3
 
 LCU_BASE_URL = None
-LCU_AUTH = None
 LCU_HEADERS = {}
 CHAMPION_NAMES = {}
-SESSION_CACHE = None
 CONNECTED = False
 GAMEFLOW_PHASE = None
 LAST_ERROR = None
@@ -42,7 +40,6 @@ SWAP_LOG = []
 _LCU_SESSION = None
 
 PHASE_TRANSLATIONS = {
-    'None': '大厅',
     'Lobby': '大厅',
     'Matchmaking': '匹配中',
     'ReadyCheck': '接受对局',
@@ -141,13 +138,12 @@ def _get_pids_fast():
 
 
 def discover_lcu():
-    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS
+    global LCU_BASE_URL, LCU_HEADERS
 
     info = find_lcu_via_logs()
     if not info:
         return False
 
-    LCU_AUTH = info
     LCU_BASE_URL = f'https://127.0.0.1:{info["port"]}'
     token = base64.b64encode(f'riot:{info["auth_token"]}'.encode()).decode()
     LCU_HEADERS = {
@@ -185,15 +181,12 @@ def _lcu_request(method, path, body=None):
     url = f'{LCU_BASE_URL}{path}'
     s = _ensure_session()
     try:
-        resp = s.request(method, url, json=body if body is not None else None,
-                         timeout=5)
+        resp = s.request(method, url, json=body, timeout=5)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
         return resp.json() if resp.text else {}
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            return None
+    except requests.exceptions.HTTPError:
         raise
     except (requests.exceptions.ConnectionError,
             requests.exceptions.Timeout) as e:
@@ -246,11 +239,10 @@ def swap_bench_champion(champion_id):
 
 
 def _refresh_after_swap():
-    global SESSION_CACHE, POLLING_RESULT
+    global POLLING_RESULT
     try:
         session = lcu_get('/lol-champ-select/v1/session')
         if session and 'benchChampions' in session:
-            SESSION_CACHE = session
             POLLING_RESULT = _build_champ_select_result(session)
     except Exception:
         pass
@@ -290,12 +282,6 @@ def _build_champ_select_result(session):
     champ_ids = [b['championId'] for b in bench if b.get('championId')]
     pickable = set(session.get('pickableChampionIds', []))
     disabled = set(session.get('bannableChampionIds', []))
-    try:
-        disabled_ids = lcu_get('/lol-champ-select/v1/disabled-champion-ids')
-        if disabled_ids:
-            disabled = set(disabled_ids)
-    except Exception:
-        pass
     my_team = session.get('myTeam', [])
     local_cell = session.get('localPlayerCellId', 0)
     actions_flat = [a for group in session.get('actions', []) for a in group]
@@ -323,15 +309,14 @@ def _build_champ_select_result(session):
 
 
 def poll_state():
-    global CONNECTED, GAMEFLOW_PHASE, SESSION_CACHE, POLLING_RESULT, LAST_ERROR
-    global LCU_BASE_URL, LCU_AUTH, LCU_HEADERS, CONNECT_ERROR_COUNT, _LCU_SESSION
+    global CONNECTED, GAMEFLOW_PHASE, POLLING_RESULT, LAST_ERROR
+    global LCU_BASE_URL, LCU_HEADERS, _LCU_SESSION
 
     while True:
         try:
             if not LCU_BASE_URL:
                 if discover_lcu():
                     CONNECTED = True
-                    CONNECT_ERROR_COUNT = 0
                     POLLING_RESULT = {
                         'connected': True, 'inChampSelect': False, 'phase': None,
                         'benchEnabled': False, 'champions': [], 'pickableIds': [],
@@ -368,8 +353,6 @@ def poll_state():
             except Exception:
                 session = None
 
-            SESSION_CACHE = session
-
             if session and 'benchChampions' in session:
                 POLLING_RESULT = _build_champ_select_result(session)
             else:
@@ -381,7 +364,6 @@ def poll_state():
                     'error': None, 'needAdmin': False
                 }
 
-            CONNECT_ERROR_COUNT = 0
             LAST_ERROR = None
 
         except Exception as e:
@@ -390,7 +372,6 @@ def poll_state():
             if is_connect_refused:
                 CONNECTED = False
                 LCU_BASE_URL = None
-                LCU_AUTH = None
                 _LCU_SESSION = None
                 print(f'[Swapper] LCU 连接被拒绝，正在重试...')
             elif LAST_ERROR is None or estr != LAST_ERROR:
