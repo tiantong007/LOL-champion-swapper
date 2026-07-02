@@ -5,29 +5,22 @@ Bypass client cooldown - instant bench swap during champ select
 """
 
 import base64
-import ctypes
-import ctypes.wintypes
 import json
-import os
 import re
 import sys
 import threading
 import time
-import webbrowser
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
+import psutil
 import requests
-
-try:
-    import webview
-    HAS_WEBVIEW = True
-except ImportError:
-    HAS_WEBVIEW = False
+import webview
 
 SWAPPER_PORT = 9753
-POLL_INTERVAL = 0.3
+POLL_INTERVAL_CONNECTED = 0.2      # 选人阶段高频轮询
+POLL_INTERVAL_DISCONNECTED = 1.0    # 未连接/客户端未运行时低频轮询
 
 AUTO_ACCEPT_ENABLED = False
 AUTO_ACCEPT_TRIGGERED = False
@@ -57,108 +50,22 @@ PHASE_TRANSLATIONS = {
 }
 
 
-def find_lcu_via_logs():
-    """Parse --remoting-auth-token from LCU log files"""
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-    for proc_name, pid in _get_pids_fast():
-        if proc_name != 'LeagueClientUx.exe':
-            continue
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            continue
+def find_lcu_via_process_cmdline():
+    """Parse --remoting-auth-token and --app-port directly from LeagueClientUx.exe process command line.
+    This is faster and more reliable than parsing log files (works even if py starts before game)."""
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            buf = ctypes.create_unicode_buffer(260)
-            sz = ctypes.wintypes.DWORD(260)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(sz)):
-                lcu_dir = os.path.dirname(buf.value)
-                for logs_candidate in (
-                    lcu_dir,
-                    os.path.join(lcu_dir, 'Logs', 'LeagueClient Logs'),
-                    os.path.join(os.path.dirname(lcu_dir), 'Logs', 'LeagueClient Logs'),
-                ):
-                    if os.path.isdir(logs_candidate):
-                        log_files = [f for f in os.listdir(logs_candidate)
-                                     if f.endswith('.log') and 'LeagueClientUx' in f and 'Helper' not in f]
-                        log_files.sort(reverse=True)
-                        for log_file in log_files[:5]:
-                            log_path = os.path.join(logs_candidate, log_file)
-                            try:
-                                with open(log_path, 'r', encoding='utf-8', errors='replace') as fh:
-                                    for line in fh:
-                                        if 'Command line arguments:' in line:
-                                            m_token = re.search(r'--remoting-auth-token=([\w\-_]+)', line)
-                                            m_port = re.search(r'--app-port=(\d+)', line)
-                                            if m_token and m_port:
-                                                return {'port': int(m_port.group(1)),
-                                                        'auth_token': m_token.group(1), 'pid': pid}
-                            except (OSError, PermissionError):
-                                continue
-        finally:
-            kernel32.CloseHandle(handle)
+            if proc.info['name'] != 'LeagueClientUx.exe':
+                continue
+            cmdline = ' '.join(proc.info['cmdline'] or [])
+            m_token = re.search(r'--remoting-auth-token=([\w\-_]+)', cmdline)
+            m_port = re.search(r'--app-port=(\d+)', cmdline)
+            if m_token and m_port:
+                return {'port': int(m_port.group(1)),
+                        'auth_token': m_token.group(1), 'pid': proc.info['pid']}
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
     return None
-
-
-def _get_pids_fast():
-    """Fast process enumeration via ctypes Toolhelp32Snapshot"""
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    TH32CS_SNAPPROCESS = 0x00000002
-    target_names = ['LeagueClientUx.exe', 'LeagueClient.exe']
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ('dwSize', ctypes.c_ulong),
-            ('cntUsage', ctypes.c_ulong),
-            ('th32ProcessID', ctypes.c_ulong),
-            ('th32DefaultHeapID', ctypes.POINTER(ctypes.c_ulong)),
-            ('th32ModuleID', ctypes.c_ulong),
-            ('cntThreads', ctypes.c_ulong),
-            ('th32ParentProcessID', ctypes.c_ulong),
-            ('pcPriClassBase', ctypes.c_long),
-            ('dwFlags', ctypes.c_ulong),
-            ('szExeFile', ctypes.c_wchar * 260),
-        ]
-
-    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == ctypes.c_void_p(-1).value:
-        return []
-
-    try:
-        pe = PROCESSENTRY32W()
-        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        if not kernel32.Process32FirstW(snapshot, ctypes.byref(pe)):
-            return []
-        pids = []
-        while True:
-            if pe.szExeFile in target_names:
-                pids.append((pe.szExeFile, pe.th32ProcessID))
-            if not kernel32.Process32NextW(snapshot, ctypes.byref(pe)):
-                break
-        return pids
-    finally:
-        kernel32.CloseHandle(snapshot)
-
-
-def discover_lcu():
-    global LCU_BASE_URL, LCU_HEADERS
-
-    info = find_lcu_via_logs()
-    if not info:
-        return False
-
-    LCU_BASE_URL = f'https://127.0.0.1:{info["port"]}'
-    token = base64.b64encode(f'riot:{info["auth_token"]}'.encode()).decode()
-    LCU_HEADERS = {
-        'Authorization': f'Basic {token}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-    }
-    try:
-        data = lcu_get('/riotclient/auth-token')
-        return data is not None
-    except Exception:
-        return False
 
 
 # ============================================================
@@ -183,17 +90,11 @@ def _lcu_request(method, path, body=None):
         return None
     url = f'{LCU_BASE_URL}{path}'
     s = _ensure_session()
-    try:
-        resp = s.request(method, url, json=body, timeout=5)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        return resp.json() if resp.text else {}
-    except requests.exceptions.HTTPError:
-        raise
-    except (requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout) as e:
-        raise
+    resp = s.request(method, url, json=body, timeout=5)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json() if resp.text else {}
 
 def lcu_get(path): return _lcu_request('GET', path)
 def lcu_post(path, body=None): return _lcu_request('POST', path, body)
@@ -296,9 +197,6 @@ def check_auto_accept(raw_phase):
 # ============================================================
 # State Polling
 # ============================================================
-POLLING_RESULT = {'connected': False, 'inChampSelect': False, 'champions': [],
-                  'phase': None, 'error': '正在启动...', 'needAdmin': False,
-                  'autoAcceptEnabled': False}
 
 
 def _build_champ_select_result(session):
@@ -328,7 +226,7 @@ def _build_champ_select_result(session):
         'firstPickAction': {'id': first_pick_action['id'],
                             'isInProgress': first_pick_action.get('isInProgress', False)}
         if first_pick_action else None,
-        'timerPhase': timer_phase, 'error': None, 'needAdmin': False,
+        'timerPhase': timer_phase, 'error': None,
         'autoAcceptEnabled': AUTO_ACCEPT_ENABLED,
     }
 
@@ -339,25 +237,38 @@ def poll_state():
 
     while True:
         try:
-            if not LCU_BASE_URL:
-                if discover_lcu():
-                    CONNECTED = True
-                    POLLING_RESULT = {
-                        'connected': True, 'inChampSelect': False, 'phase': None,
-                        'benchEnabled': False, 'champions': [], 'pickableIds': [],
-                        'selfChampion': 0, 'selfChampionName': None,
-                        'firstPickAction': None, 'timerPhase': None,
-                        'error': None, 'needAdmin': False,
-                    }
-                    fetch_champion_names()
-                    print(f'[Swapper] 已连接 LCU: {LCU_BASE_URL}')
-                else:
-                    POLLING_RESULT = {
-                        'connected': False, 'inChampSelect': False, 'phase': None,
-                        'champions': [], 'error': '等待英雄联盟客户端...', 'needAdmin': False
-                    }
-                    time.sleep(POLL_INTERVAL)
-                    continue
+            # Always re-detect LCU: check if process port changed or connection lost
+            info = find_lcu_via_process_cmdline()
+            if not info:
+                # Process not found
+                CONNECTED = False
+                LCU_BASE_URL = None
+                _LCU_SESSION = None
+                CHAMPION_NAMES = {}
+                POLLING_RESULT = {
+                    'connected': False, 'inChampSelect': False, 'phase': None,
+                    'champions': [], 'error': '等待英雄联盟客户端...',
+                }
+                time.sleep(POLL_INTERVAL_DISCONNECTED)
+                continue
+
+            # Process found - check if port/token changed (game restart)
+            new_base = f'https://127.0.0.1:{info["port"]}'
+            new_token = base64.b64encode(f'riot:{info["auth_token"]}'.encode()).decode()
+
+            if LCU_BASE_URL != new_base or LCU_HEADERS.get('Authorization') != f'Basic {new_token}':
+                # Port or token changed - update connection info
+                LCU_BASE_URL = new_base
+                LCU_HEADERS = {
+                    'Authorization': f'Basic {new_token}',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                }
+                _LCU_SESSION = None  # Reset session to use new auth
+                CHAMPION_NAMES = {}  # Reset champion names
+                CONNECTED = True
+                fetch_champion_names()
+                print(f'[Swapper] 已连接 LCU: {LCU_BASE_URL}')
 
             if not CHAMPION_NAMES:
                 fetch_champion_names()
@@ -389,29 +300,28 @@ def poll_state():
                     'benchEnabled': False, 'champions': [], 'pickableIds': [],
                     'selfChampion': 0, 'selfChampionName': None,
                     'firstPickAction': None, 'timerPhase': None,
-                    'error': None, 'needAdmin': False
+                    'error': None
                 }
 
             LAST_ERROR = None
 
         except Exception as e:
             estr = str(e)
-            is_connect_refused = 'Connection refused' in estr
-            if is_connect_refused:
-                CONNECTED = False
-                LCU_BASE_URL = None
-                _LCU_SESSION = None
-                print(f'[Swapper] LCU 连接被拒绝，正在重试...')
-            elif LAST_ERROR is None or estr != LAST_ERROR:
+            if LAST_ERROR is None or estr != LAST_ERROR:
                 LAST_ERROR = estr
                 print(f'[Swapper] 轮询错误: {e}')
             POLLING_RESULT = {
                 'connected': CONNECTED, 'inChampSelect': False, 'phase': None,
-                'champions': [], 'error': estr, 'needAdmin': False
+                'champions': [], 'error': estr
             }
 
         POLLING_RESULT['autoAcceptEnabled'] = AUTO_ACCEPT_ENABLED
-        time.sleep(POLL_INTERVAL)
+
+        # Adaptive polling: faster when in champ select, slower when idle
+        if CONNECTED and POLLING_RESULT.get('inChampSelect'):
+            time.sleep(POLL_INTERVAL_CONNECTED)       # 0.2s 选人中
+        else:
+            time.sleep(POLL_INTERVAL_DISCONNECTED)     # 1.0s 其他情况
 
 
 # ============================================================
@@ -453,12 +363,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .champ-card .badge.yours{background:#0d2818;color:#4ade80}
   .champ-card .badge.off-cd{background:#1e1b0d;color:#fbbf24}
   .empty-state{text-align:center;padding:48px 16px;color:#8892a0}
-  .empty-state .icon-big{font-size:48px;margin-bottom:12px}
   .empty-state p{font-size:14px}
-  .admin-banner{background:#2d1b1b;border:1px solid #f87171;border-radius:8px;padding:16px;margin-bottom:16px;text-align:center}
-  .admin-banner p{color:#f87171;font-size:14px;margin-bottom:12px}
-  .admin-banner .btn{background:#f87171;color:#151c24;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
-  .admin-banner .btn:hover{opacity:.85}
   .log-section{margin-top:24px}
   .log-section .section-title{cursor:pointer;user-select:none}
   .log-box{background:#111a24;border:1px solid #2a3444;border-radius:6px;padding:12px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.6}
@@ -470,11 +375,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .log-entry.error{color:#f87171}
   .btn{background:#f59e0b;color:#151c24;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
   .btn:hover{opacity:.85}
-  .btn:disabled{opacity:.4;cursor:not-allowed}
-  .btn.secondary{background:#2a3444;color:#d1d5db}
-  .btn.secondary:hover{background:#354254}
-  .quick-pick-section{background:#1a2332;border:1px solid #2a3444;border-radius:10px;padding:16px;margin-bottom:24px;display:none}
-  .quick-pick-section h3{font-size:13px;color:#22c55e;margin-bottom:8px}
   .header-right{display:flex;align-items:center;gap:12px}
   .setting-row{display:flex;align-items:center;justify-content:space-between;background:#1a2332;border:1px solid #2a3444;border-radius:8px;padding:12px 16px;margin-bottom:20px}
   .setting-row .setting-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#e0e3e8}
@@ -491,7 +391,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
 <div class="container" id="app">
   <div class="header">
-      <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.2</span></h1>
+      <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.3</span></h1>
     <div class="header-right">
       <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub</a>
     </div>
@@ -502,10 +402,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <span id="status-text">正在连接 LCU...</span>
   </div>
 
-  <div id="admin-banner" class="admin-banner" style="display:none">
-    <p>需要管理员权限才能读取 LCU 连接信息，请以管理员身份重新运行</p>
-    <p style="font-size:13px;color:#fca5a5;margin-bottom:8px">右键 start.bat → 以管理员身份运行</p>
-  </div>
+
 
   <div class="setting-row">
     <div class="setting-label">
@@ -569,18 +466,7 @@ function updateUI(data){
   _lastDataKey = dk;
   const sb = document.getElementById('status-bar');
   const st = document.getElementById('status-text');
-  const ab = document.getElementById('admin-banner');
 
-  if (data.needAdmin) {
-    sb.className = 'status-bar disconnected';
-    st.textContent = '需要管理员权限';
-    ab.style.display = 'block';
-    document.getElementById('mode-value').textContent = '-';
-    document.getElementById('self-champ-value').textContent = '-';
-    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + data.error + '</p></div>';
-    return;
-  }
-  ab.style.display = 'none';
   syncAutoAcceptUI(data.autoAcceptEnabled);
 
   if (!data.connected) {
@@ -790,20 +676,6 @@ def run_desktop():
     print('\n正在关闭...')
 
 
-def run_browser():
-    server = HTTPServer(('127.0.0.1', SWAPPER_PORT), SwapHandler)
-    print(f'[Web UI] http://127.0.0.1:{SWAPPER_PORT}')
-    try:
-        webbrowser.open(f'http://127.0.0.1:{SWAPPER_PORT}')
-    except Exception:
-        pass
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print('\n正在关闭...')
-        server.shutdown()
-
-
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -818,10 +690,7 @@ def main():
     poll_thread.start()
     time.sleep(1)
 
-    if HAS_WEBVIEW:
-        run_desktop()
-    else:
-        run_browser()
+    run_desktop()
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-# ⚡ 海克斯大乱斗秒换英雄 v1.2
+# ⚡ 海克斯大乱斗秒换英雄 v1.3
 
 英雄联盟大乱斗模式选人阶段自动绕过冷却秒换英雄工具。
 
@@ -11,7 +11,6 @@
 - 自动接受对局（可选开关）
 - 实时显示连接状态、游戏阶段
 - 内置操作日志
-- 支持桌面窗口（pywebview）和浏览器两种模式
 
 ## 使用
 
@@ -37,7 +36,8 @@ python -m PyInstaller "海克斯大乱斗秒换英雄.spec" --clean
 
 - Python 3.7+
 - requests
-- pywebview（可选，提供桌面窗口）
+- psutil
+- pywebview
 - PyInstaller（仅打包时需要）
 
 ```bash
@@ -46,10 +46,10 @@ pip install -r requirements.txt
 
 ## 原理
 
-通过解析 LCU 进程日志获取 `--remoting-auth-token` 和 `--app-port`，利用 LCU API 发送 HTTP 请求绕过客户端的换英雄冷却。需管理员权限读取进程日志。
+通过 `psutil` 直接读取 `LeagueClientUx.exe` 进程命令行，提取 `--remoting-auth-token` 和 `--app-port`，利用 LCU API 发送 HTTP 请求绕过客户端的换英雄冷却。无需管理员权限。
 
 ## ⚠️ 注意事项
 
-- 需要以**管理员身份**运行（读取 LCU 日志需要权限）
+- **无需管理员权限**（直接读取进程命令行）
 - 仅在大乱斗（ARAM）模式有效
 - 使用风险自负，可能违反腾讯/拳头游戏用户协议
