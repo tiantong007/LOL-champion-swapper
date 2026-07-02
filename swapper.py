@@ -491,7 +491,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
 <div class="container" id="app">
   <div class="header">
-    <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.1</span></h1>
+      <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.2</span></h1>
     <div class="header-right">
       <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub</a>
     </div>
