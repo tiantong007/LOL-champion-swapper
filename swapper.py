@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 League of Legends ARAM Bench Champion Swapper
 Bypass client cooldown - instant bench swap during champ select
@@ -29,6 +29,9 @@ except ImportError:
 SWAPPER_PORT = 9753
 POLL_INTERVAL = 0.3
 
+AUTO_ACCEPT_ENABLED = False
+AUTO_ACCEPT_TRIGGERED = False
+ACCEPT_DELAY = 0.8
 LCU_BASE_URL = None
 LCU_HEADERS = {}
 CHAMPION_NAMES = {}
@@ -270,11 +273,32 @@ def log_swap(msg):
     print(entry)
 
 
+def check_auto_accept(raw_phase):
+    global AUTO_ACCEPT_TRIGGERED
+    if not AUTO_ACCEPT_ENABLED:
+        AUTO_ACCEPT_TRIGGERED = False
+        return
+    if raw_phase == 'ReadyCheck' and not AUTO_ACCEPT_TRIGGERED:
+        try:
+            rc = lcu_get('/lol-matchmaking/v1/ready-check')
+            if rc and rc.get('state') == 'InProgress':
+                log_swap(f'检测到对局，{ACCEPT_DELAY}s 后自动接受...')
+                time.sleep(ACCEPT_DELAY)
+                lcu_post('/lol-matchmaking/v1/ready-check/accept')
+                log_swap('已自动接受对局 \u2713')
+                AUTO_ACCEPT_TRIGGERED = True
+        except Exception as e:
+            log_swap(f'自动接受失败: {e}')
+    elif raw_phase != 'ReadyCheck':
+        AUTO_ACCEPT_TRIGGERED = False
+
+
 # ============================================================
 # State Polling
 # ============================================================
 POLLING_RESULT = {'connected': False, 'inChampSelect': False, 'champions': [],
-                  'phase': None, 'error': '正在启动...', 'needAdmin': False}
+                  'phase': None, 'error': '正在启动...', 'needAdmin': False,
+                  'autoAcceptEnabled': False}
 
 
 def _build_champ_select_result(session):
@@ -305,6 +329,7 @@ def _build_champ_select_result(session):
                             'isInProgress': first_pick_action.get('isInProgress', False)}
         if first_pick_action else None,
         'timerPhase': timer_phase, 'error': None, 'needAdmin': False,
+        'autoAcceptEnabled': AUTO_ACCEPT_ENABLED,
     }
 
 
@@ -337,15 +362,18 @@ def poll_state():
             if not CHAMPION_NAMES:
                 fetch_champion_names()
 
+            raw_phase = None
             try:
                 gf = lcu_get('/lol-gameflow/v1/session')
                 if gf and 'phase' in gf:
-                    raw = gf['phase']
-                    GAMEFLOW_PHASE = PHASE_TRANSLATIONS.get(raw, raw)
+                    raw_phase = gf['phase']
+                    GAMEFLOW_PHASE = PHASE_TRANSLATIONS.get(raw_phase, raw_phase)
                 else:
                     GAMEFLOW_PHASE = None
             except Exception:
                 GAMEFLOW_PHASE = None
+            if raw_phase:
+                check_auto_accept(raw_phase)
 
             session = None
             try:
@@ -382,6 +410,7 @@ def poll_state():
                 'champions': [], 'error': estr, 'needAdmin': False
             }
 
+        POLLING_RESULT['autoAcceptEnabled'] = AUTO_ACCEPT_ENABLED
         time.sleep(POLL_INTERVAL)
 
 
@@ -396,9 +425,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <title>海克斯大乱斗秒换英雄</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e14;color:#c8cbd1;min-height:100vh}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#151c24;color:#d1d5db;min-height:100vh}
   .container{max-width:800px;margin:0 auto;padding:20px}
-  .header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid #1e232c;margin-bottom:24px}
+  .header{display:flex;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid #2a3444;margin-bottom:24px}
   .header h1{font-size:20px;font-weight:700;color:#f59e0b}
   .status-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:8px;margin-bottom:20px;font-size:13px}
   .status-bar.connected{background:#0d2818;color:#4ade80}
@@ -409,43 +438,53 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   .status-bar.disconnected .status-dot{background:#f87171}
   .status-bar.waiting .status-dot{background:#fbbf24}
   .info-row{display:flex;gap:12px;margin-bottom:24px}
-  .info-card{flex:1;background:#111820;border-radius:8px;padding:12px 16px;border:1px solid #1e232c}
-  .info-card .label{font-size:11px;color:#6b7280;margin-bottom:4px}
+  .info-card{flex:1;background:#1a2332;border-radius:8px;padding:12px 16px;border:1px solid #2a3444}
+  .info-card .label{font-size:11px;color:#8892a0;margin-bottom:4px}
   .info-card .value{font-size:16px;font-weight:600}
   .section-title{font-size:14px;font-weight:600;color:#9ca3af;margin-bottom:12px;display:flex;align-items:center;gap:8px}
   .champ-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px;margin-bottom:24px}
-  .champ-card{background:#111820;border:1px solid #1e232c;border-radius:10px;padding:12px;text-align:center;cursor:pointer;transition:all .15s ease;user-select:none}
-  .champ-card:hover{background:#1a2430;border-color:#f59e0b;transform:translateY(-2px);box-shadow:0 4px 12px rgba(245,158,11,.15)}
+  .champ-card{background:#1a2332;border:1px solid #2a3444;border-radius:10px;padding:12px;text-align:center;cursor:pointer;transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease;user-select:none;will-change:transform}
+  .champ-card:hover{background:#243044;border-color:#f59e0b;transform:translateY(-2px);box-shadow:0 4px 12px rgba(245,158,11,.15)}
   .champ-card:active{transform:scale(.96)}
-  .champ-card .icon{width:64px;height:64px;border-radius:50%;margin:0 auto 8px;display:block;border:2px solid #1e232c;background:#0d1117}
+  .champ-card .icon{width:64px;height:64px;border-radius:50%;margin:0 auto 8px;display:block;border:2px solid #2a3444;background:#111a24}
   .champ-card .name{font-size:13px;font-weight:500;color:#e0e3e8}
   .champ-card.picking .icon{border-color:#22c55e}
   .champ-card .badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:4px;margin-top:4px}
   .champ-card .badge.yours{background:#0d2818;color:#4ade80}
   .champ-card .badge.off-cd{background:#1e1b0d;color:#fbbf24}
-  .empty-state{text-align:center;padding:48px 16px;color:#6b7280}
+  .empty-state{text-align:center;padding:48px 16px;color:#8892a0}
   .empty-state .icon-big{font-size:48px;margin-bottom:12px}
   .empty-state p{font-size:14px}
   .admin-banner{background:#2d1b1b;border:1px solid #f87171;border-radius:8px;padding:16px;margin-bottom:16px;text-align:center}
   .admin-banner p{color:#f87171;font-size:14px;margin-bottom:12px}
-  .admin-banner .btn{background:#f87171;color:#0a0e14;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
+  .admin-banner .btn{background:#f87171;color:#151c24;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer}
   .admin-banner .btn:hover{opacity:.85}
   .log-section{margin-top:24px}
   .log-section .section-title{cursor:pointer;user-select:none}
-  .log-box{background:#090d13;border:1px solid #1e232c;border-radius:6px;padding:12px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.6}
+  .log-box{background:#111a24;border:1px solid #2a3444;border-radius:6px;padding:12px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.6}
   .log-box::-webkit-scrollbar{width:4px}
-  .log-box::-webkit-scrollbar-track{background:#090d13}
-  .log-box::-webkit-scrollbar-thumb{background:#1e232c;border-radius:2px}
-  .log-entry{color:#6b7280}
+  .log-box::-webkit-scrollbar-track{background:#111a24}
+  .log-box::-webkit-scrollbar-thumb{background:#2a3444;border-radius:2px}
+  .log-entry{color:#8892a0}
   .log-entry.success{color:#4ade80}
   .log-entry.error{color:#f87171}
-  .btn{background:#f59e0b;color:#0a0e14;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+  .btn{background:#f59e0b;color:#151c24;border:none;padding:8px 20px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
   .btn:hover{opacity:.85}
   .btn:disabled{opacity:.4;cursor:not-allowed}
-  .btn.secondary{background:#1e232c;color:#c8cbd1}
-  .btn.secondary:hover{background:#2a3340}
-  .quick-pick-section{background:#111820;border:1px solid #1e232c;border-radius:10px;padding:16px;margin-bottom:24px;display:none}
+  .btn.secondary{background:#2a3444;color:#d1d5db}
+  .btn.secondary:hover{background:#354254}
+  .quick-pick-section{background:#1a2332;border:1px solid #2a3444;border-radius:10px;padding:16px;margin-bottom:24px;display:none}
   .quick-pick-section h3{font-size:13px;color:#22c55e;margin-bottom:8px}
+  .header-right{display:flex;align-items:center;gap:12px}
+  .setting-row{display:flex;align-items:center;justify-content:space-between;background:#1a2332;border:1px solid #2a3444;border-radius:8px;padding:12px 16px;margin-bottom:20px}
+  .setting-row .setting-label{display:flex;align-items:center;gap:8px;font-size:14px;color:#e0e3e8}
+  .setting-row .setting-icon{font-size:16px}
+  .toggle-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+  .toggle-label input{display:none}
+  .toggle-slider{width:36px;height:20px;background:#2a3444;border-radius:10px;position:relative;transition:background .2s}
+  .toggle-slider::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:#8892a0;top:2px;left:2px;transition:all .2s}
+  .toggle-label input:checked+.toggle-slider{background:#f59e0b}
+  .toggle-label input:checked+.toggle-slider::after{background:#fff;left:18px}
   @media(max-width:600px){.champ-grid{grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px}.champ-card .icon{width:48px;height:48px}.info-row{flex-direction:column}}
 </style>
 </head>
@@ -453,7 +492,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <div class="container" id="app">
   <div class="header">
     <h1>&#x26A1; 海克斯大乱斗秒换英雄 <span style="font-size:12px;color:#6b7280;font-weight:400">v1.1</span></h1>
-    <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub项目地址</a>
+    <div class="header-right">
+      <a href="https://github.com/tiantong007/LOL-champion-swapper" target="_blank" style="font-size:12px;color:#6b7280;text-decoration:none">GitHub</a>
+    </div>
   </div>
 
   <div id="status-bar" class="status-bar waiting">
@@ -464,6 +505,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
   <div id="admin-banner" class="admin-banner" style="display:none">
     <p>需要管理员权限才能读取 LCU 连接信息，请以管理员身份重新运行</p>
     <p style="font-size:13px;color:#fca5a5;margin-bottom:8px">右键 start.bat → 以管理员身份运行</p>
+  </div>
+
+  <div class="setting-row">
+    <div class="setting-label">
+      <span class="setting-icon">&#x2699;</span>
+      <span>自动接受对局</span>
+    </div>
+    <label class="toggle-label">
+      <input type="checkbox" id="auto-accept-toggle" onchange="toggleAutoAccept(this.checked)">
+      <span class="toggle-slider"></span>
+    </label>
   </div>
 
   <div class="info-row">
@@ -484,10 +536,32 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
 <script>
 const POLL_URL = '/api/state';
-function poll(){
-  fetch(POLL_URL).then(r=>r.json()).then(updateUI).catch(()=>{});
-  setTimeout(poll, 300);
+let _pollTimer = null;
+let _swapPending = false;
+
+function doPoll(){
+  fetch(POLL_URL).then(r=>r.json()).then(data => {
+    updateUI(data);
+    if (!data.connected) scheduleNext(2000);
+    else if (!data.inChampSelect) scheduleNext(1000);
+    else scheduleNext(300);
+  }).catch(() => scheduleNext(2000));
 }
+
+function scheduleNext(ms){
+  if (_pollTimer) clearTimeout(_pollTimer);
+  _pollTimer = setTimeout(doPoll, ms);
+}
+
+function fetchNow(){
+  fetch(POLL_URL).then(r=>r.json()).then(updateUI).catch(()=>{});
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (_pollTimer) clearTimeout(_pollTimer);
+  if (document.hidden) { _pollTimer = setTimeout(doPoll, 2000); }
+  else { _pollTimer = setTimeout(doPoll, 300); }
+});
 
 function updateUI(data){
   const dk = JSON.stringify(data);
@@ -507,19 +581,21 @@ function updateUI(data){
     return;
   }
   ab.style.display = 'none';
+  syncAutoAcceptUI(data.autoAcceptEnabled);
 
   if (!data.connected) {
     sb.className = 'status-bar disconnected';
     st.textContent = data.error || '未连接';
     document.getElementById('mode-value').textContent = '-';
     document.getElementById('self-champ-value').textContent = '-';
-    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + (data.error||'等待客户端...') + '</p></div>';
+    document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>' + (data.error||'等待客户端..') + '</p></div>';
     return;
   }
 
   if (!data.inChampSelect) {
     sb.className = 'status-bar waiting';
-    st.textContent = '已连接 (' + (data.phase || '大厅') + ')';
+    st.textContent = '已连接(' + (data.phase || '大厅') + ')';
+    st.textContent += (data.autoAcceptEnabled ? ' ● 自动接受' : '');
     document.getElementById('mode-value').textContent = '-';
     document.getElementById('self-champ-value').textContent = '-';
     document.getElementById('champ-grid').innerHTML = '<div class="empty-state"><p>等待进入选人...</p></div>';
@@ -528,7 +604,8 @@ function updateUI(data){
 
   sb.className = 'status-bar connected';
   st.textContent = '选人中 · ' + (data.champions.length + '个可选');
-  document.getElementById('mode-value').textContent = data.benchEnabled ? '大乱斗 (可选模式)' : '普通模式';
+  st.textContent += (data.autoAcceptEnabled ? ' ● 自动接受' : '');
+  document.getElementById('mode-value').textContent = data.benchEnabled ? '大乱斗(可选模式)' : '普通模式';
   const sc = data.selfChampion || 0;
   document.getElementById('self-champ-value').textContent = data.selfChampionName || (sc > 0 ? '#' + sc : '未选择');
 
@@ -555,20 +632,29 @@ function renderBench(champs, selfChamp){
   grid.innerHTML = champs.map(c => {
     const isYours = c.id === selfChamp;
     return '<div class="champ-card' + (isYours?' picking':'') + '" onclick="swapChamp(' + c.id + ')" title="点击秒换">'
-      + '<img class="icon" src="/api/icon/' + c.id + '" alt="' + c.name + '" onerror="this.style.display=\\'none\\'">'
+      + '<img class="icon" src="/api/icon/' + c.id + '" alt="' + c.name + '" onerror="handleIconError(this)">'
       + '<div class="name">' + c.name + '</div>'
       + (isYours ? '<div class="badge yours">当前</div>' : '<div class="badge off-cd">秒换</div>')
       + '</div>';
   }).join('');
 }
 
+function handleIconError(img){
+  img.style.display = 'none';
+}
+
 async function swapChamp(id){
+  if (_swapPending) return;
+  _swapPending = true;
   try{
     const r = await fetch('/api/swap/' + id, {method:'POST'});
     const d = await r.json();
-    addLog(d.success?'success':'error', (d.success?'✓ 换到: ':'✗ 失败: ')+(d.name||'#'+id));
+    addLog(d.success?'success':'error', (d.success?'✅ 换到: ':'❌ 失败: ')+(d.name||'#'+id));
+    fetchNow();
   }catch(e){
-    addLog('error', '✗ 请求失败: '+e.message);
+    addLog('error', '❌ 请求失败: '+e.message);
+  }finally{
+    _swapPending = false;
   }
 }
 
@@ -586,7 +672,21 @@ function toggleLog(){
   box.style.display = box.style.display==='none'?'block':'none';
 }
 
-poll();
+function syncAutoAcceptUI(enabled){
+  const cb = document.getElementById('auto-accept-toggle');
+  if (cb) cb.checked = !!enabled;
+}
+
+async function toggleAutoAccept(enabled){
+  try{
+    await fetch('/api/settings/auto-accept', {method:'POST', body:JSON.stringify({enabled})});
+    addLog(enabled?'success':'error', (enabled?'已开启自动接受对局':'已关闭自动接受对局'));
+  }catch(e){
+    addLog('error', '切换自动接受失败: '+e.message);
+  }
+}
+
+scheduleNext(1000);
 </script>
 </body>
 </html>'''
@@ -633,6 +733,15 @@ class SwapHandler(BaseHTTPRequestHandler):
                     {'success': ok, 'name': CHAMPION_NAMES.get(cid, f'#{cid}')}).encode('utf-8'))
             except (ValueError, IndexError):
                 self._ok('application/json', json.dumps({'success': False, 'error': '参数错误'}).encode('utf-8'))
+        elif path == '/api/settings/auto-accept':
+            global AUTO_ACCEPT_ENABLED
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = json.loads(self.rfile.read(content_length).decode('utf-8'))
+                AUTO_ACCEPT_ENABLED = body.get('enabled', False)
+                self._ok('application/json', json.dumps({'enabled': AUTO_ACCEPT_ENABLED}).encode('utf-8'))
+            except Exception as e:
+                self._ok('application/json', json.dumps({'error': str(e)}).encode('utf-8'))
         else:
             self._err(404)
 
